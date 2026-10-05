@@ -1,4 +1,4 @@
-"""Transcribe short audio with Groq Whisper and extract meeting actions.
+"""Transcribe short audio with a hosted ASR model and extract meeting actions.
 
 The module keeps provider calls behind a small protocol so all parsing and
 Markdown/JSON rendering can be tested without an API key.
@@ -13,8 +13,13 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-DEFAULT_TRANSCRIPTION_MODEL = "whisper-large-v3"
-DEFAULT_SUMMARY_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_PROVIDER = "huggingface"
+DEFAULT_TRANSCRIPTION_MODEL = "openai/whisper-large-v3"
+DEFAULT_SUMMARY_MODEL = "Qwen/Qwen2.5-72B-Instruct"
+GROQ_TRANSCRIPTION_MODEL = "whisper-large-v3"
+GROQ_SUMMARY_MODEL = "llama-3.3-70b-versatile"
+HF_ASR_PROVIDER = "hf-inference"
+HF_CHAT_PROVIDER = "featherless-ai"
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
 SUPPORTED_EXTENSIONS = {".flac", ".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".ogg", ".wav", ".webm"}
 
@@ -45,6 +50,31 @@ class ProviderClient(Protocol):
     def transcribe(self, audio_path: Path, language: str | None = None) -> str: ...
 
     def summarize(self, transcript: str) -> SummaryReport: ...
+
+
+def _summary_system_prompt() -> str:
+    schema_description = {
+        "speaker_intent": "short description of why the speaker is talking",
+        "summary": "one concise paragraph",
+        "main_points": ["important point"],
+        "action_items": [
+            {"task": "specific next step", "owner": "person or null", "due_date": "date or null", "priority": "high|medium|low"}
+        ],
+    }
+    return (
+        "You extract meeting or voice-note actions. Respond with JSON only, no Markdown and no commentary. "
+        "Use exactly these keys and types. Do not invent facts; use null for unknown owner or due date. "
+        f"Schema example: {json.dumps(schema_description)}"
+    )
+
+
+def _parse_summary_response(content: str | None, provider_name: str) -> SummaryReport:
+    if not content:
+        raise AudioSummarizerError(f"{provider_name} returned an empty summary.")
+    try:
+        return SummaryReport.model_validate_json(content)
+    except (ValidationError, ValueError) as exc:
+        raise AudioSummarizerError(f"The model returned invalid summary JSON: {exc}") from exc
 
 
 class GroqProvider:
@@ -80,19 +110,6 @@ class GroqProvider:
         return text.strip()
 
     def summarize(self, transcript: str) -> SummaryReport:
-        schema_description = {
-            "speaker_intent": "short description of why the speaker is talking",
-            "summary": "one concise paragraph",
-            "main_points": ["important point"],
-            "action_items": [
-                {"task": "specific next step", "owner": "person or null", "due_date": "date or null", "priority": "high|medium|low"}
-            ],
-        }
-        system_prompt = (
-            "You extract meeting or voice-note actions. Respond with JSON only, no Markdown and no commentary. "
-            "Use exactly these keys and types. Do not invent facts; use null for unknown owner or due date. "
-            f"Schema example: {json.dumps(schema_description)}"
-        )
         try:
             response = self.client.chat.completions.create(
                 model=self.summary_model,
@@ -100,19 +117,60 @@ class GroqProvider:
                 max_tokens=2_000,
                 response_format={"type": "json_object"},
                 messages=[
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": _summary_system_prompt()},
                     {"role": "user", "content": f"Transcript:\n\n{transcript}"},
                 ],
             )
         except Exception as exc:
             raise AudioSummarizerError(f"Groq summarization failed: {exc}") from exc
         content = response.choices[0].message.content if response.choices else None
-        if not content:
-            raise AudioSummarizerError("Groq returned an empty summary.")
+        return _parse_summary_response(content, "Groq")
+
+
+class HuggingFaceProvider:
+    """Use HF Inference Providers: hf-inference for ASR and Featherless for chat."""
+
+    def __init__(self, transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL, summary_model: str = DEFAULT_SUMMARY_MODEL) -> None:
         try:
-            return SummaryReport.model_validate_json(content)
-        except (ValidationError, ValueError) as exc:
-            raise AudioSummarizerError(f"The model returned invalid summary JSON: {exc}") from exc
+            from huggingface_hub import InferenceClient
+        except ImportError as exc:
+            raise AudioSummarizerError("Install dependencies first: py -m pip install -r requirements.txt") from exc
+        token = os.getenv("HF_TOKEN")
+        if not token:
+            raise AudioSummarizerError("HF_TOKEN is missing. Set it in PowerShell before using --provider huggingface.")
+        self.asr = InferenceClient(provider=HF_ASR_PROVIDER, token=token)
+        self.chat = InferenceClient(provider=HF_CHAT_PROVIDER, token=token)
+        self.transcription_model = transcription_model
+        self.summary_model = summary_model
+
+    def transcribe(self, audio_path: Path, language: str | None = None) -> str:
+        try:
+            extra_body = {"language": language} if language else None
+            result = self.asr.automatic_speech_recognition(audio_path, model=self.transcription_model, extra_body=extra_body)
+        except Exception as exc:
+            raise AudioSummarizerError(f"Hugging Face transcription failed: {exc}") from exc
+        text = getattr(result, "text", None)
+        if not text or not text.strip():
+            raise AudioSummarizerError("Hugging Face returned an empty transcript.")
+        return text.strip()
+
+    def summarize(self, transcript: str) -> SummaryReport:
+        try:
+            response = self.chat.chat_completion(
+                model=self.summary_model,
+                messages=[
+                    {"role": "system", "content": _summary_system_prompt()},
+                    {"role": "user", "content": f"Transcript:\n\n{transcript}"},
+                ],
+                temperature=0,
+                max_tokens=2_000,
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:
+            raise AudioSummarizerError(f"Hugging Face summarization failed: {exc}") from exc
+        choices = getattr(response, "choices", [])
+        content = getattr(choices[0].message, "content", None) if choices else None
+        return _parse_summary_response(content, "Hugging Face")
 
 
 def validate_audio_path(audio_path: Path, max_bytes: int = MAX_AUDIO_BYTES) -> Path:
@@ -162,12 +220,13 @@ def build_report(audio_path: Path, provider: ProviderClient, language: str | Non
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Transcribe audio and extract structured action items with Groq.")
+    parser = argparse.ArgumentParser(description="Transcribe audio and extract structured action items with an AI provider.")
     parser.add_argument("audio", type=Path, help="MP3, WAV, M4A, OGG, FLAC, MP4, WEBM, or related supported audio file")
     parser.add_argument("--language", help="Optional ISO-639-1 language code, such as en or zh")
     parser.add_argument("--output", type=Path, help="Optional output path; .json writes JSON, other extensions write Markdown")
-    parser.add_argument("--transcription-model", default=DEFAULT_TRANSCRIPTION_MODEL)
-    parser.add_argument("--summary-model", default=DEFAULT_SUMMARY_MODEL)
+    parser.add_argument("--provider", choices=("huggingface", "groq"), default=DEFAULT_PROVIDER)
+    parser.add_argument("--transcription-model", help="Provider-specific transcription model")
+    parser.add_argument("--summary-model", help="Provider-specific summarization model")
     parser.add_argument("--transcript-only", action="store_true", help="Print only the transcript and skip summarization")
     return parser.parse_args()
 
@@ -176,7 +235,10 @@ def main() -> int:
     args = parse_args()
     try:
         path = validate_audio_path(args.audio)
-        provider = GroqProvider(args.transcription_model, args.summary_model)
+        if args.provider == "huggingface":
+            provider = HuggingFaceProvider(args.transcription_model or DEFAULT_TRANSCRIPTION_MODEL, args.summary_model or DEFAULT_SUMMARY_MODEL)
+        else:
+            provider = GroqProvider(args.transcription_model or GROQ_TRANSCRIPTION_MODEL, args.summary_model or GROQ_SUMMARY_MODEL)
         transcript = provider.transcribe(path, args.language)
         if args.transcript_only:
             print(transcript)
