@@ -145,8 +145,9 @@ class HuggingFaceProvider:
 
     def transcribe(self, audio_path: Path, language: str | None = None) -> str:
         try:
-            extra_body = {"language": language} if language else None
-            result = self.asr.automatic_speech_recognition(audio_path, model=self.transcription_model, extra_body=extra_body)
+            # The HF Inference ASR pipeline currently rejects the generic
+            # `language` parameter, so Whisper performs automatic detection.
+            result = self.asr.automatic_speech_recognition(audio_path, model=self.transcription_model)
         except Exception as exc:
             raise AudioSummarizerError(f"Hugging Face transcription failed: {exc}") from exc
         text = getattr(result, "text", None)

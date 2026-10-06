@@ -108,7 +108,7 @@ Print only the transcript:
 .\.venv\Scripts\python.exe audio_summarizer.py "D:\Recordings\meeting.wav" --provider huggingface --language en --transcript-only
 ```
 
-The `--language` option is optional. For Cantonese or Mandarin recordings, try the appropriate ISO-639-1 code such as `zh` and review the transcript carefully.
+The `--language` option is accepted for provider compatibility. Groq can use it as an ASR hint; the Hugging Face ASR route currently uses Whisper's automatic language detection because its serverless pipeline rejects the generic `language` parameter. Review transcripts carefully, especially for Cantonese or Mandarin recordings.
 
 ## Example report fields
 

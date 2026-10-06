@@ -23,5 +23,6 @@ flowchart LR
 
 - The app rejects files larger than 25 MB before upload; provider limits can change.
 - The tool does not identify speakers unless the transcript itself contains speaker information.
+- Hugging Face ASR currently uses Whisper automatic language detection; the optional language hint is applied only by the Groq route.
 - Due dates and owners are `null`/unknown when they are not stated; the model is instructed not to invent them.
 - Audio and transcripts are sent to the selected provider when the API path is used. Do not use confidential recordings without reviewing current provider terms.
